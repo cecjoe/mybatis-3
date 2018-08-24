@@ -1,5 +1,5 @@
 /**
- *    Copyright 2009-2015 the original author or authors.
+ *    Copyright 2009-2018 the original author or authors.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 
 import org.apache.ibatis.annotations.Arg;
@@ -45,6 +47,8 @@ import org.apache.ibatis.annotations.InsertProvider;
 import org.apache.ibatis.annotations.Lang;
 import org.apache.ibatis.annotations.MapKey;
 import org.apache.ibatis.annotations.Options;
+import org.apache.ibatis.annotations.Options.FlushCachePolicy;
+import org.apache.ibatis.annotations.Property;
 import org.apache.ibatis.annotations.Result;
 import org.apache.ibatis.annotations.ResultMap;
 import org.apache.ibatis.annotations.ResultType;
@@ -61,6 +65,7 @@ import org.apache.ibatis.builder.BuilderException;
 import org.apache.ibatis.builder.IncompleteElementException;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
+import org.apache.ibatis.cursor.Cursor;
 import org.apache.ibatis.executor.keygen.Jdbc3KeyGenerator;
 import org.apache.ibatis.executor.keygen.KeyGenerator;
 import org.apache.ibatis.executor.keygen.NoKeyGenerator;
@@ -75,6 +80,8 @@ import org.apache.ibatis.mapping.ResultSetType;
 import org.apache.ibatis.mapping.SqlCommandType;
 import org.apache.ibatis.mapping.SqlSource;
 import org.apache.ibatis.mapping.StatementType;
+import org.apache.ibatis.parsing.PropertyParser;
+import org.apache.ibatis.reflection.TypeParameterResolver;
 import org.apache.ibatis.scripting.LanguageDriver;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.ResultHandler;
@@ -85,31 +92,34 @@ import org.apache.ibatis.type.UnknownTypeHandler;
 
 /**
  * @author Clinton Begin
+ * @author Kazuki Shimizu
  */
 public class MapperAnnotationBuilder {
 
-  private final Set<Class<? extends Annotation>> sqlAnnotationTypes = new HashSet<Class<? extends Annotation>>();
-  private final Set<Class<? extends Annotation>> sqlProviderAnnotationTypes = new HashSet<Class<? extends Annotation>>();
+  private static final Set<Class<? extends Annotation>> SQL_ANNOTATION_TYPES = new HashSet<>();
+  private static final Set<Class<? extends Annotation>> SQL_PROVIDER_ANNOTATION_TYPES = new HashSet<>();
 
-  private Configuration configuration;
-  private MapperBuilderAssistant assistant;
-  private Class<?> type;
+  private final Configuration configuration;
+  private final MapperBuilderAssistant assistant;
+  private final Class<?> type;
+
+  static {
+    SQL_ANNOTATION_TYPES.add(Select.class);
+    SQL_ANNOTATION_TYPES.add(Insert.class);
+    SQL_ANNOTATION_TYPES.add(Update.class);
+    SQL_ANNOTATION_TYPES.add(Delete.class);
+
+    SQL_PROVIDER_ANNOTATION_TYPES.add(SelectProvider.class);
+    SQL_PROVIDER_ANNOTATION_TYPES.add(InsertProvider.class);
+    SQL_PROVIDER_ANNOTATION_TYPES.add(UpdateProvider.class);
+    SQL_PROVIDER_ANNOTATION_TYPES.add(DeleteProvider.class);
+  }
 
   public MapperAnnotationBuilder(Configuration configuration, Class<?> type) {
     String resource = type.getName().replace('.', '/') + ".java (best guess)";
     this.assistant = new MapperBuilderAssistant(configuration, resource);
     this.configuration = configuration;
     this.type = type;
-
-    sqlAnnotationTypes.add(Select.class);
-    sqlAnnotationTypes.add(Insert.class);
-    sqlAnnotationTypes.add(Update.class);
-    sqlAnnotationTypes.add(Delete.class);
-
-    sqlProviderAnnotationTypes.add(SelectProvider.class);
-    sqlProviderAnnotationTypes.add(InsertProvider.class);
-    sqlProviderAnnotationTypes.add(UpdateProvider.class);
-    sqlProviderAnnotationTypes.add(DeleteProvider.class);
   }
 
   public void parse() {
@@ -174,14 +184,36 @@ public class MapperAnnotationBuilder {
     if (cacheDomain != null) {
       Integer size = cacheDomain.size() == 0 ? null : cacheDomain.size();
       Long flushInterval = cacheDomain.flushInterval() == 0 ? null : cacheDomain.flushInterval();
-      assistant.useNewCache(cacheDomain.implementation(), cacheDomain.eviction(), flushInterval, size, cacheDomain.readWrite(), cacheDomain.blocking(), null);
+      Properties props = convertToProperties(cacheDomain.properties());
+      assistant.useNewCache(cacheDomain.implementation(), cacheDomain.eviction(), flushInterval, size, cacheDomain.readWrite(), cacheDomain.blocking(), props);
     }
+  }
+
+  private Properties convertToProperties(Property[] properties) {
+    if (properties.length == 0) {
+      return null;
+    }
+    Properties props = new Properties();
+    for (Property property : properties) {
+      props.setProperty(property.name(),
+          PropertyParser.parse(property.value(), configuration.getVariables()));
+    }
+    return props;
   }
 
   private void parseCacheRef() {
     CacheNamespaceRef cacheDomainRef = type.getAnnotation(CacheNamespaceRef.class);
     if (cacheDomainRef != null) {
-      assistant.useCacheRef(cacheDomainRef.value().getName());
+      Class<?> refType = cacheDomainRef.value();
+      String refName = cacheDomainRef.name();
+      if (refType == void.class && refName.isEmpty()) {
+        throw new BuilderException("Should be specified either value() or name() attribute in the @CacheNamespaceRef");
+      }
+      if (refType != void.class && !refName.isEmpty()) {
+        throw new BuilderException("Cannot use both value() and name() attribute in the @CacheNamespaceRef");
+      }
+      String namespace = (refType != void.class) ? refType.getName() : refName;
+      assistant.useCacheRef(namespace);
     }
   }
 
@@ -196,6 +228,10 @@ public class MapperAnnotationBuilder {
   }
 
   private String generateResultMapName(Method method) {
+    Results results = method.getAnnotation(Results.class);
+    if (results != null && !results.id().isEmpty()) {
+      return type.getName() + "." + results.id();
+    }
     StringBuilder suffix = new StringBuilder();
     for (Class<?> c : method.getParameterTypes()) {
       suffix.append("-");
@@ -208,7 +244,7 @@ public class MapperAnnotationBuilder {
   }
 
   private void applyResultMap(String resultMapId, Class<?> returnType, Arg[] args, Result[] results, TypeDiscriminator discriminator) {
-    List<ResultMapping> resultMappings = new ArrayList<ResultMapping>();
+    List<ResultMapping> resultMappings = new ArrayList<>();
     applyConstructorArgs(args, returnType, resultMappings);
     applyResults(results, returnType, resultMappings);
     Discriminator disc = applyDiscriminator(resultMapId, returnType, discriminator);
@@ -221,7 +257,7 @@ public class MapperAnnotationBuilder {
     if (discriminator != null) {
       for (Case c : discriminator.cases()) {
         String caseResultMapId = resultMapId + "-" + c.value();
-        List<ResultMapping> resultMappings = new ArrayList<ResultMapping>();
+        List<ResultMapping> resultMappings = new ArrayList<>();
         // issue #136
         applyConstructorArgs(c.constructArgs(), resultType, resultMappings);
         applyResults(c.results(), resultType, resultMappings);
@@ -236,9 +272,11 @@ public class MapperAnnotationBuilder {
       String column = discriminator.column();
       Class<?> javaType = discriminator.javaType() == void.class ? String.class : discriminator.javaType();
       JdbcType jdbcType = discriminator.jdbcType() == JdbcType.UNDEFINED ? null : discriminator.jdbcType();
-      Class<? extends TypeHandler<?>> typeHandler = discriminator.typeHandler() == UnknownTypeHandler.class ? null : discriminator.typeHandler();
+      @SuppressWarnings("unchecked")
+      Class<? extends TypeHandler<?>> typeHandler = (Class<? extends TypeHandler<?>>)
+              (discriminator.typeHandler() == UnknownTypeHandler.class ? null : discriminator.typeHandler());
       Case[] cases = discriminator.cases();
-      Map<String, String> discriminatorMap = new HashMap<String, String>();
+      Map<String, String> discriminatorMap = new HashMap<>();
       for (Case c : cases) {
         String value = c.value();
         String caseResultMapId = resultMapId + "-" + value;
@@ -266,7 +304,7 @@ public class MapperAnnotationBuilder {
       boolean useCache = isSelect;
 
       KeyGenerator keyGenerator;
-      String keyProperty = "id";
+      String keyProperty = null;
       String keyColumn = null;
       if (SqlCommandType.INSERT.equals(sqlCommandType) || SqlCommandType.UPDATE.equals(sqlCommandType)) {
         // first check for SelectKey annotation - that overrides everything else
@@ -275,18 +313,22 @@ public class MapperAnnotationBuilder {
           keyGenerator = handleSelectKeyAnnotation(selectKey, mappedStatementId, getParameterType(method), languageDriver);
           keyProperty = selectKey.keyProperty();
         } else if (options == null) {
-          keyGenerator = configuration.isUseGeneratedKeys() ? new Jdbc3KeyGenerator() : new NoKeyGenerator();
+          keyGenerator = configuration.isUseGeneratedKeys() ? Jdbc3KeyGenerator.INSTANCE : NoKeyGenerator.INSTANCE;
         } else {
-          keyGenerator = options.useGeneratedKeys() ? new Jdbc3KeyGenerator() : new NoKeyGenerator();
+          keyGenerator = options.useGeneratedKeys() ? Jdbc3KeyGenerator.INSTANCE : NoKeyGenerator.INSTANCE;
           keyProperty = options.keyProperty();
           keyColumn = options.keyColumn();
         }
       } else {
-        keyGenerator = new NoKeyGenerator();
+        keyGenerator = NoKeyGenerator.INSTANCE;
       }
 
       if (options != null) {
-        flushCache = options.flushCache();
+        if (FlushCachePolicy.TRUE.equals(options.flushCache())) {
+          flushCache = true;
+        } else if (FlushCachePolicy.FALSE.equals(options.flushCache())) {
+          flushCache = false;
+        }
         useCache = options.useCache();
         fetchSize = options.fetchSize() > -1 || options.fetchSize() == Integer.MIN_VALUE ? options.fetchSize() : null; //issue #348
         timeout = options.timeout() > -1 ? options.timeout() : null;
@@ -325,7 +367,7 @@ public class MapperAnnotationBuilder {
           resultSetType,
           flushCache,
           useCache,
-          // TODO issue #577
+          // TODO gcode issue #577
           false,
           keyGenerator,
           keyProperty,
@@ -334,13 +376,13 @@ public class MapperAnnotationBuilder {
           null,
           languageDriver,
           // ResultSets
-          null);
+          options != null ? nullOrEmpty(options.resultSets()) : null);
     }
   }
   
   private LanguageDriver getLanguageDriver(Method method) {
     Lang lang = method.getAnnotation(Lang.class);
-    Class<?> langClass = null;
+    Class<? extends LanguageDriver> langClass = null;
     if (lang != null) {
       langClass = lang.value();
     }
@@ -350,10 +392,10 @@ public class MapperAnnotationBuilder {
   private Class<?> getParameterType(Method method) {
     Class<?> parameterType = null;
     Class<?>[] parameterTypes = method.getParameterTypes();
-    for (int i = 0; i < parameterTypes.length; i++) {
-      if (!RowBounds.class.isAssignableFrom(parameterTypes[i]) && !ResultHandler.class.isAssignableFrom(parameterTypes[i])) {
+    for (Class<?> currentParameterType : parameterTypes) {
+      if (!RowBounds.class.isAssignableFrom(currentParameterType) && !ResultHandler.class.isAssignableFrom(currentParameterType)) {
         if (parameterType == null) {
-          parameterType = parameterTypes[i];
+          parameterType = currentParameterType;
         } else {
           // issue #135
           parameterType = ParamMap.class;
@@ -365,43 +407,54 @@ public class MapperAnnotationBuilder {
 
   private Class<?> getReturnType(Method method) {
     Class<?> returnType = method.getReturnType();
-    // issue #508
-    if (void.class.equals(returnType)) {
-      ResultType rt = method.getAnnotation(ResultType.class);
-      if (rt != null) {
-        returnType = rt.value();
-      } 
-    } else if (Collection.class.isAssignableFrom(returnType)) {
-      Type returnTypeParameter = method.getGenericReturnType();
-      if (returnTypeParameter instanceof ParameterizedType) {
-        Type[] actualTypeArguments = ((ParameterizedType) returnTypeParameter).getActualTypeArguments();
+    Type resolvedReturnType = TypeParameterResolver.resolveReturnType(method, type);
+    if (resolvedReturnType instanceof Class) {
+      returnType = (Class<?>) resolvedReturnType;
+      if (returnType.isArray()) {
+        returnType = returnType.getComponentType();
+      }
+      // gcode issue #508
+      if (void.class.equals(returnType)) {
+        ResultType rt = method.getAnnotation(ResultType.class);
+        if (rt != null) {
+          returnType = rt.value();
+        }
+      }
+    } else if (resolvedReturnType instanceof ParameterizedType) {
+      ParameterizedType parameterizedType = (ParameterizedType) resolvedReturnType;
+      Class<?> rawType = (Class<?>) parameterizedType.getRawType();
+      if (Collection.class.isAssignableFrom(rawType) || Cursor.class.isAssignableFrom(rawType)) {
+        Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
         if (actualTypeArguments != null && actualTypeArguments.length == 1) {
-          returnTypeParameter = actualTypeArguments[0];
-          if (returnTypeParameter instanceof Class) {
+          Type returnTypeParameter = actualTypeArguments[0];
+          if (returnTypeParameter instanceof Class<?>) {
             returnType = (Class<?>) returnTypeParameter;
           } else if (returnTypeParameter instanceof ParameterizedType) {
-            // (issue #443) actual type can be a also a parameterized type
+            // (gcode issue #443) actual type can be a also a parameterized type
             returnType = (Class<?>) ((ParameterizedType) returnTypeParameter).getRawType();
           } else if (returnTypeParameter instanceof GenericArrayType) {
             Class<?> componentType = (Class<?>) ((GenericArrayType) returnTypeParameter).getGenericComponentType();
-            // (issue #525) support List<byte[]>
+            // (gcode issue #525) support List<byte[]>
             returnType = Array.newInstance(componentType, 0).getClass();
           }
         }
-      }
-    } else if (method.isAnnotationPresent(MapKey.class) && Map.class.isAssignableFrom(returnType)) {
-      // (issue 504) Do not look into Maps if there is not MapKey annotation
-      Type returnTypeParameter = method.getGenericReturnType();
-      if (returnTypeParameter instanceof ParameterizedType) {
-        Type[] actualTypeArguments = ((ParameterizedType) returnTypeParameter).getActualTypeArguments();
-        if (actualTypeArguments != null && actualTypeArguments.length == 2) {
-          returnTypeParameter = actualTypeArguments[1];
-          if (returnTypeParameter instanceof Class) {
-            returnType = (Class<?>) returnTypeParameter;
-          } else if (returnTypeParameter instanceof ParameterizedType) {
-            // (issue 443) actual type can be a also a parameterized type
-            returnType = (Class<?>) ((ParameterizedType) returnTypeParameter).getRawType();
+      } else if (method.isAnnotationPresent(MapKey.class) && Map.class.isAssignableFrom(rawType)) {
+        // (gcode issue 504) Do not look into Maps if there is not MapKey annotation
+        Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+          if (actualTypeArguments != null && actualTypeArguments.length == 2) {
+            Type returnTypeParameter = actualTypeArguments[1];
+            if (returnTypeParameter instanceof Class<?>) {
+              returnType = (Class<?>) returnTypeParameter;
+            } else if (returnTypeParameter instanceof ParameterizedType) {
+              // (gcode issue 443) actual type can be a also a parameterized type
+              returnType = (Class<?>) ((ParameterizedType) returnTypeParameter).getRawType();
+            }
           }
+      } else if (Optional.class.equals(rawType)) {
+        Type[] actualTypeArguments = parameterizedType.getActualTypeArguments();
+        Type returnTypeParameter = actualTypeArguments[0];
+        if (returnTypeParameter instanceof Class<?>) {
+          returnType = (Class<?>) returnTypeParameter;
         }
       }
     }
@@ -422,7 +475,7 @@ public class MapperAnnotationBuilder {
         return buildSqlSourceFromStrings(strings, parameterType, languageDriver);
       } else if (sqlProviderAnnotationType != null) {
         Annotation sqlProviderAnnotation = method.getAnnotation(sqlProviderAnnotationType);
-        return new ProviderSqlSource(assistant.getConfiguration(), sqlProviderAnnotation);
+        return new ProviderSqlSource(assistant.getConfiguration(), sqlProviderAnnotation, type, method);
       }
       return null;
     } catch (Exception e) {
@@ -464,11 +517,11 @@ public class MapperAnnotationBuilder {
   }
 
   private Class<? extends Annotation> getSqlAnnotationType(Method method) {
-    return chooseAnnotationType(method, sqlAnnotationTypes);
+    return chooseAnnotationType(method, SQL_ANNOTATION_TYPES);
   }
 
   private Class<? extends Annotation> getSqlProviderAnnotationType(Method method) {
-    return chooseAnnotationType(method, sqlProviderAnnotationTypes);
+    return chooseAnnotationType(method, SQL_PROVIDER_ANNOTATION_TYPES);
   }
 
   private Class<? extends Annotation> chooseAnnotationType(Method method, Set<Class<? extends Annotation>> types) {
@@ -483,10 +536,13 @@ public class MapperAnnotationBuilder {
 
   private void applyResults(Result[] results, Class<?> resultType, List<ResultMapping> resultMappings) {
     for (Result result : results) {
-      List<ResultFlag> flags = new ArrayList<ResultFlag>();
+      List<ResultFlag> flags = new ArrayList<>();
       if (result.id()) {
         flags.add(ResultFlag.ID);
       }
+      @SuppressWarnings("unchecked")
+      Class<? extends TypeHandler<?>> typeHandler = (Class<? extends TypeHandler<?>>)
+              ((result.typeHandler() == UnknownTypeHandler.class) ? null : result.typeHandler());
       ResultMapping resultMapping = assistant.buildResultMapping(
           resultType,
           nullOrEmpty(result.property()),
@@ -497,7 +553,7 @@ public class MapperAnnotationBuilder {
           null,
           null,
           null,
-          result.typeHandler() == UnknownTypeHandler.class ? null : result.typeHandler(),
+          typeHandler,
           flags,
           null,
           null,
@@ -505,7 +561,7 @@ public class MapperAnnotationBuilder {
       resultMappings.add(resultMapping);
     }
   }
-
+  
   private String nestedSelectId(Result result) {
     String nestedSelect = result.one().select();
     if (nestedSelect.length() < 1) {
@@ -520,9 +576,9 @@ public class MapperAnnotationBuilder {
   private boolean isLazy(Result result) {
     boolean isLazy = configuration.isLazyLoadingEnabled();
     if (result.one().select().length() > 0 && FetchType.DEFAULT != result.one().fetchType()) {
-      isLazy = (result.one().fetchType() == FetchType.LAZY);
+      isLazy = result.one().fetchType() == FetchType.LAZY;
     } else if (result.many().select().length() > 0 && FetchType.DEFAULT != result.many().fetchType()) {
-      isLazy = (result.many().fetchType() == FetchType.LAZY);
+      isLazy = result.many().fetchType() == FetchType.LAZY;
     }
     return isLazy;
   }
@@ -536,22 +592,25 @@ public class MapperAnnotationBuilder {
 
   private void applyConstructorArgs(Arg[] args, Class<?> resultType, List<ResultMapping> resultMappings) {
     for (Arg arg : args) {
-      List<ResultFlag> flags = new ArrayList<ResultFlag>();
+      List<ResultFlag> flags = new ArrayList<>();
       flags.add(ResultFlag.CONSTRUCTOR);
       if (arg.id()) {
         flags.add(ResultFlag.ID);
       }
+      @SuppressWarnings("unchecked")
+      Class<? extends TypeHandler<?>> typeHandler = (Class<? extends TypeHandler<?>>)
+              (arg.typeHandler() == UnknownTypeHandler.class ? null : arg.typeHandler());
       ResultMapping resultMapping = assistant.buildResultMapping(
           resultType,
-          null,
+          nullOrEmpty(arg.name()),
           nullOrEmpty(arg.column()),
           arg.javaType() == void.class ? null : arg.javaType(),
           arg.jdbcType() == JdbcType.UNDEFINED ? null : arg.jdbcType(),
           nullOrEmpty(arg.select()),
           nullOrEmpty(arg.resultMap()),
           null,
-          null,
-          arg.typeHandler() == UnknownTypeHandler.class ? null : arg.typeHandler(),
+          nullOrEmpty(arg.columnPrefix()),
+          typeHandler,
           flags,
           null,
           null,
@@ -582,7 +641,7 @@ public class MapperAnnotationBuilder {
 
     // defaults
     boolean useCache = false;
-    KeyGenerator keyGenerator = new NoKeyGenerator();
+    KeyGenerator keyGenerator = NoKeyGenerator.INSTANCE;
     Integer fetchSize = null;
     Integer timeout = null;
     boolean flushCache = false;

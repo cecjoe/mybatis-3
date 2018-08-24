@@ -1,5 +1,5 @@
 /**
- *    Copyright 2009-2015 the original author or authors.
+ *    Copyright 2009-2018 the original author or authors.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ package org.apache.ibatis.executor.loader;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.ByteArrayInputStream;
@@ -28,8 +27,6 @@ import java.io.ObjectStreamException;
 import java.io.Serializable;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.HashSet;
-
 import org.apache.ibatis.domain.blog.Author;
 import org.apache.ibatis.domain.blog.Section;
 import org.apache.ibatis.executor.ExecutorException;
@@ -179,20 +176,19 @@ public abstract class SerializableProxyTest {
   }
 
   protected byte[] serialize(Serializable value) throws Exception {
-    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-    ObjectOutputStream oos = new ObjectOutputStream(bos);
-    oos.writeObject(value);
-    oos.flush();
-    oos.close();
-    return bos.toByteArray();
+    try(ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+      oos.writeObject(value);
+      oos.flush();
+      return bos.toByteArray();
+    }
   }
 
   protected Serializable deserialize(byte[] value) throws Exception {
-    ByteArrayInputStream bis = new ByteArrayInputStream(value);
-    ObjectInputStream ois = new ObjectInputStream(bis);
-    Serializable result = (Serializable) ois.readObject();
-    ois.close();
-    return result;
+    try(ByteArrayInputStream bis = new ByteArrayInputStream(value);
+    ObjectInputStream ois = new ObjectInputStream(bis)) {
+      return (Serializable) ois.readObject();
+    }
   }
 
   public static class AuthorWithWriteReplaceMethod extends Author {

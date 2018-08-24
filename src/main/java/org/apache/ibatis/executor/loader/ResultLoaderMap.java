@@ -1,5 +1,5 @@
 /**
- *    Copyright 2009-2015 the original author or authors.
+ *    Copyright 2009-2018 the original author or authors.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.ibatis.cursor.Cursor;
 import org.apache.ibatis.executor.BaseExecutor;
 import org.apache.ibatis.executor.BatchResult;
 import org.apache.ibatis.executor.ExecutorException;
@@ -46,7 +47,7 @@ import org.apache.ibatis.session.RowBounds;
  */
 public class ResultLoaderMap {
 
-  private final Map<String, LoadPair> loaderMap = new HashMap<String, LoadPair>();
+  private final Map<String, LoadPair> loaderMap = new HashMap<>();
 
   public void addLoader(String property, MetaObject metaResultObject, ResultLoader resultLoader) {
     String upperFirst = getUppercaseFirstProperty(property);
@@ -59,7 +60,7 @@ public class ResultLoaderMap {
   }
 
   public final Map<String, LoadPair> getProperties() {
-    return new HashMap<String, LoadPair>(this.loaderMap);
+    return new HashMap<>(this.loaderMap);
   }
 
   public Set<String> getPropertyNames() {
@@ -81,6 +82,10 @@ public class ResultLoaderMap {
       return true;
     }
     return false;
+  }
+
+  public void remove(String property) {
+    loaderMap.remove(property.toUpperCase(Locale.ENGLISH));
   }
 
   public void loadAll() throws SQLException {
@@ -243,6 +248,8 @@ public class ResultLoaderMap {
         } else {
           configurationObject = factoryMethod.invoke(null);
         }
+      } catch (final ExecutorException ex) {
+        throw ex;
       } catch (final NoSuchMethodException ex) {
         throw new ExecutorException("Cannot get Configuration as factory class ["
                 + this.configurationFactory + "] is missing factory method of name ["
@@ -298,6 +305,11 @@ public class ResultLoaderMap {
 
     @Override
     protected <E> List<E> doQuery(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
+      throw new UnsupportedOperationException("Not supported.");
+    }
+
+    @Override
+    protected <E> Cursor<E> doQueryCursor(MappedStatement ms, Object parameter, RowBounds rowBounds, BoundSql boundSql) throws SQLException {
       throw new UnsupportedOperationException("Not supported.");
     }
   }
